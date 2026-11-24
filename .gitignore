@@ -38,11 +38,6 @@
 *.out
 *.app
 
-# Build directories
-[Bb]uild/
-[Bb]uild-*/
-cmake-build-*/
-
 # CMake generated files
 CMakeFiles/
 CMakeCache.txt
@@ -66,3 +61,12 @@ vcpkg_installed/
 # test output & cache
 Testing/
 .cache/
+
+# AI prompts
+aiprompts/
+
+# Datasheets
+datasheets/
+
+# Schematics
+schematics/
