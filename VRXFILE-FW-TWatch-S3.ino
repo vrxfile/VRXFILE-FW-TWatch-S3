@@ -7,6 +7,7 @@
  * Required libraries (install via Arduino IDE Library Manager):
  * 1. LovyanGFX (by lovyan03)
  * 2. TinyGPSPlus (by Mikal Hart)
+ * 3. SensorLib (by Lewis He) - optional, enables Bosch BMA423 hardware pedometer microcode
  */
 
 #include <Arduino.h>
@@ -18,7 +19,10 @@
 #include <Preferences.h>
 #include <time.h>
 #include <driver/ledc.h>
+#include <driver/gpio.h>
+#include <esp_sleep.h>
 #include <esp_wifi.h>
+#include <esp_bt.h>
 #include <esp_idf_version.h>
 #include <lwip/etharp.h>
 #include <lwip/netif.h>
@@ -39,6 +43,12 @@
 #endif
 #include <LovyanGFX.hpp>
 #include <TinyGPS++.h>
+#if __has_include(<SensorBMA423.hpp>)
+#define HAS_SENSORLIB_BMA423 1
+#include <SensorBMA423.hpp>
+#else
+#define HAS_SENSORLIB_BMA423 0
+#endif
 #include <math.h>
 #include <inttypes.h>
 #include <stdlib.h>
@@ -79,10 +89,17 @@
 #define LCD_CS_PIN          12
 #define LCD_BL_PIN          45
 
+// Active mode CPU frequency (80 MHz for reduced power consumption)
+#define ACTIVE_CPU_FREQ_MHZ 80
+
+// Wake-up interrupt pins for ESP32-S3 Light Sleep (active LOW with INPUT_PULLUP)
+#define BMA423_INT_PIN      14  // BMA423 hardware INT1 line (IO14)
+#define WAKE_BUTTON_PIN     0   // User button / BOOT pin (IO0)
+
 // MIA-M10Q GPS module pins (fixed 38400 baud)
 #define GPS_RX_PIN          41  // Configured as UART RX
 #define GPS_TX_PIN          42  // Configured as UART TX
-#define GPS_PPS_PIN         0   // TIMEPULSE / PPS line
+#define GPS_PPS_PIN         0   // TIMEPULSE / PPS line (shared with IO0 wake button)
 
 // IR LED IR12-21C pin (via Q15 MMBT3904 transistor) and LEDC hardware channel
 #define IR_SEND_PIN         2
@@ -105,6 +122,28 @@
 #define DRV2605_ADDR        0x5A
 #define BMA423_ADDR_LOW     0x18
 #define BMA423_ADDR_HIGH    0x19
+
+// FT6336U power-saving register definitions (Active / Monitor / Hibernate)
+#define FT6336_REG_CTRL             0x86
+#define FT6336_REG_TIMEENTERMONITOR 0x87
+#define FT6336_REG_PERIODACTIVE     0x88
+#define FT6336_REG_PERIODMONITOR    0x89
+#define FT6336_REG_G_MODE           0xA4
+#define FT6336_REG_PMODE            0xA5
+#define FT6336_PMODE_ACTIVE         0x00
+#define FT6336_PMODE_MONITOR        0x01
+#define FT6336_PMODE_HIBERNATE      0x03
+
+// BMA423 hardware pedometer & INT1 interrupt register definitions
+#define BMA423_REG_INT_STATUS_0     0x1C
+#define BMA423_REG_STEP_COUNTER_0   0x1E
+#define BMA423_REG_INTERNAL_STATUS  0x2A
+#define BMA423_REG_INT1_IO_CTRL     0x53
+#define BMA423_REG_INT_LATCH        0x55
+#define BMA423_REG_INT_MAP_1        0x56
+#define BMA423_REG_PWR_CONF         0x7C
+#define BMA423_REG_PWR_CTRL         0x7D
+#define BMA423_REG_CMD              0x7E
 
 // Backlight brightness levels (0..255)
 #define BRIGHTNESS_FULL     240
@@ -375,11 +414,16 @@ int16_t prevTouchY         = -1;                          // Previous touch Y co
 bool earthDragging         = false;                       // Active drag flag for smooth FPS
 bool earthShowSatellite    = false;                       // Show satellite orbits and markers (S button)
 
-// State variables for Step counter screen (BMA423 accelerometer)
+// State variables for Step counter screen (BMA423 accelerometer & hardware pedometer)
 uint8_t bma423Addr         = 0;                           // Detected BMA423 I2C address (0x18 or 0x19)
 bool bma423Ready           = false;                       // BMA423 initialization success flag
+bool bma423HwPedometerReady = false;                      // BMA423 internal ASIC hardware step counter active
 #define STEP_SAVE_INTERVAL_MS 600000UL                    // Auto-save step count to Flash every 10 minutes
 uint32_t stepCount         = 0;                           // Total step count
+uint32_t stepCountBase     = 0;                           // Flash-restored base offset added to BMA423 HW counter
+uint32_t bma423HwStepZeroOffset = 0;                      // Zero-offset subtracted from raw 0x1E..0x21 after reset
+uint32_t bma423LastHwSteps = 0;                           // Last delta step count read from BMA423 0x1E..0x21
+uint32_t lastHwStepSyncMs  = 0;                           // 1 Hz hardware step counter read timer
 uint32_t lastSavedStepCount = 0;                          // Last step count persisted to Flash
 uint32_t lastStepSaveMs    = 0;                           // Step count auto-save timer (10 minutes)
 uint32_t lastStepPollMs    = 0;                           // Accelerometer polling timer (50 Hz)
@@ -387,7 +431,14 @@ uint32_t lastStepDetectMs  = 0;                           // Timestamp of last d
 float stepBaselineMag      = 1.0f;                        // Moving average of gravity magnitude (g)
 float stepFilteredMag      = 1.0f;                        // Smoothed acceleration vector magnitude (g)
 bool stepPeakActive        = false;                       // Step detector hysteresis flag
+#if HAS_SENSORLIB_BMA423
+SensorBMA423 bma423Sensor;
+#endif
 void saveStepCountToFlash(bool force);
+void configureBma423WakeInterrupt();
+uint32_t readBma423HardwareSteps();
+void syncBma423HardwareSteps();
+void resetBma423HardwareSteps();
 
 // State variables for Inclinometer screen (BMA423 bubble level)
 float inclFiltGx           = 0.0f;                        // Smoothed X-axis acceleration (g)
@@ -1148,7 +1199,7 @@ void updateMorsePlayback();
 // State structures and variables for Settings screen (persisted to Flash via Preferences)
 #define DISPLAY_TIME_OPT_COUNT   9
 #define CHARGE_CURRENT_OPT_COUNT 4
-#define SETTINGS_ITEM_COUNT      7
+#define SETTINGS_ITEM_COUNT      8
 #define SETTINGS_VISIBLE_ROWS    4
 #define TOUCH_SENS_MIN_VAL       30
 #define TOUCH_SENS_MAX_VAL       80
@@ -1166,12 +1217,14 @@ enum SettingsView {
   SETTINGS_VIEW_TOUCH_VIB  = 4,
   SETTINGS_VIEW_TOUCH_SENS = 5,
   SETTINGS_VIEW_CHARGE_CURR = 6,
-  SETTINGS_VIEW_POWER       = 7
+  SETTINGS_VIEW_POWER       = 7,
+  SETTINGS_VIEW_WAKE_CONDITION = 8
 };
 
 Preferences settingsPrefs;
 SettingsView settingsView         = SETTINGS_VIEW_LIST;
 uint8_t settingsScrollOffset      = 0;                    // Vertical scroll offset for Settings list
+bool settingWifiEnabled           = true;                 // Global Wi-Fi radio power enable
 bool settingWifiAutoConnect       = true;                 // Allow automatic Wi-Fi reconnection
 uint8_t settingDisplayBrightness  = 94;                   // Backlight brightness (5..100%)
 uint16_t settingDisplayLightSec   = 30;                   // Backlight auto-off timeout (0 = never off)
@@ -1181,6 +1234,10 @@ uint8_t settingWakeTapCount       = 2;                    // Screen wake gesture
 uint16_t settingChargeCurrentMa   = 200;                  // AXP2101 battery charge current (100/200/300/400 mA)
 bool settingPowerGps              = true;                 // AXP2101 BLDO1 GPS power rail enable
 bool settingPowerLora             = true;                 // AXP2101 ALDO4 LoRa power rail enable
+bool settingWakeOnTouch           = true;                 // Light Sleep wake on screen touch (TOUCH_INT_PIN / IO16)
+bool settingWakeOnBma423          = true;                 // Light Sleep wake on BMA423 interrupt (IO14)
+bool settingWakeOnButton          = true;                 // Light Sleep wake on button press (IO0)
+bool editWifiEnabled              = true;                 // Temporary Wi-Fi power toggle before OK/Cancel
 bool editWifiAutoConnect          = true;                 // Temporary toggle state before OK/Cancel
 uint8_t editDisplayBrightness     = 94;                   // Temporary brightness before OK/Cancel (5..100%)
 uint8_t editDisplayTimeIdx        = 4;                    // Timeout index in DISPLAY_TIME_OPTIONS (4 -> 30 s)
@@ -1190,13 +1247,34 @@ uint8_t editWakeTapCount          = 2;                    // Temporary wake gest
 uint16_t editChargeCurrentMa      = 200;                  // Temporary charge current before OK/Cancel
 bool editPowerGps                 = true;                 // Temporary GPS BLDO1 toggle before OK/Cancel
 bool editPowerLora                = true;                 // Temporary LoRa ALDO4 toggle before OK/Cancel
+bool editWakeOnTouch              = true;                 // Temporary wake-on-touch toggle before OK/Cancel
+bool editWakeOnBma423             = true;                 // Temporary wake-on-BMA423 toggle before OK/Cancel
+bool editWakeOnButton             = true;                 // Temporary wake-on-button toggle before OK/Cancel
 bool settingsSliderDragging       = false;                // Brightness slider drag flag
 bool touchSensSliderDragging      = false;                // Touch sensitivity slider drag flag
 bool touchVibActive               = false;                // Active haptic pulse flag
 uint32_t touchVibEndMs            = 0;                    // End timestamp of short haptic pulse
+bool displaySleeping              = false;                // True while ST7789V display controller is in sleep mode
+bool touchInMonitorMode           = false;                // True while FT6336U is in low-power Monitor/Hibernate mode
+bool gpsUartActive                = false;                // True while GPSSerial UART is initialized
+bool speakerAmpPowered            = false;                // True while AXP2101 DLDO1 (MAX98357A) rail is enabled
 #define TOUCH_VIB_DURATION_MS     35UL                    // Touch vibration pulse duration (ms)
 void initTouchScreen();
+void setTouchActiveMode();
+void setTouchMonitorMode();
+void setTouchHibernateMode();
+void putDisplayToSleep();
+void wakeDisplayFromSleep();
+void enterDisplayOffLightSleep();
 void applyAxp2101PowerSettings();
+void applyAxp2101LightSleepRails();
+void setSpeakerAmpPower(bool enable);
+void updateSpeakerAmpPower();
+void applyGpsUartState();
+void applyWifiPowerState();
+void reinitDRV2605LAfterSleep();
+void stopWifiJamDetect();
+void stopHostsScan();
 
 // Tetris game state (10x20 standard well, 7 tetrominoes, score/lines/level, pause, game over)
 #define TETRIS_COLS 10
@@ -1922,29 +2000,95 @@ uint8_t chargeCurrentToAxpReg(uint16_t ma) {
   }
 }
 
-// Apply saved charge current (reg 0x62) and GPS/LoRa LDO enables (reg 0x90: BLDO1/ALDO4) to AXP2101
+// AXP2101 LDO_ONOFF_CTRL0 (reg 0x90) rail bit definitions
+#define AXP2101_LDO0_CORE_MASK        0x07  // ALDO1(0x01) | ALDO2(0x02) | ALDO3(0x04)
+#define AXP2101_LDO0_ALDO4_LORA_MASK  0x08  // ALDO4 (bit 3): LoRa SX1262 VDD
+#define AXP2101_LDO0_BLDO1_GPS_MASK   0x10  // BLDO1 (bit 4): GPS MIA-M10Q VDD
+#define AXP2101_LDO0_BLDO2_MASK       0x20  // BLDO2 (bit 5): DRV2605L / AVDD
+#define AXP2101_LDO0_DLDO1_SPK_MASK   0x80  // DLDO1 (bit 7): MAX98357A speaker amp SPK_VDD
+#define AXP2101_LDO0_ACTIVE_BASE_MASK (AXP2101_LDO0_CORE_MASK | AXP2101_LDO0_BLDO2_MASK) // 0x27 (DLDO1 OFF by default)
+
+// Gate MAX98357A speaker amplifier power (AXP2101 DLDO1, reg 0x90 bit 7) on demand
+void setSpeakerAmpPower(bool enable) {
+  uint8_t ldoEn = readRegI2C(Wire, AXP2101_ADDR, 0x90);
+  if (enable) {
+    ldoEn |= AXP2101_LDO0_DLDO1_SPK_MASK;
+  } else {
+    ldoEn &= (uint8_t)(~AXP2101_LDO0_DLDO1_SPK_MASK);
+  }
+  writeRegI2C(Wire, AXP2101_ADDR, 0x90, ldoEn);
+  speakerAmpPowered = enable;
+}
+
+// Keep MAX98357A DLDO1 powered only while an audio playback engine is active
+void updateSpeakerAmpPower() {
+  bool needSpeaker = (sndGenPlaying || alertAudioPlaying || cwAudioPlaying);
+  if (needSpeaker != speakerAmpPowered) {
+    setSpeakerAmpPower(needSpeaker);
+  }
+}
+
+// Configure GPS UART pins: active UART when GPS is enabled, high-impedance INPUT when GPS is disabled
+void applyGpsUartState() {
+  if (settingPowerGps) {
+    if (!gpsUartActive) {
+      GPSSerial.begin(currentGpsBaud, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
+      gpsUartActive = true;
+    }
+  } else {
+    if (gpsUartActive) {
+      GPSSerial.end();
+      gpsUartActive = false;
+    }
+    // High-impedance INPUT (no pull-up / no drive) prevents current leakage into powered-off GPS module
+    pinMode(GPS_RX_PIN, INPUT);
+    pinMode(GPS_TX_PIN, INPUT);
+  }
+}
+
+// Apply saved charge current (reg 0x62) and active LDO enables (reg 0x90: BLDO1/ALDO4/BLDO2, gated DLDO1)
 void applyAxp2101PowerSettings() {
   uint8_t reg62 = readRegI2C(Wire, AXP2101_ADDR, 0x62);
   uint8_t iccCode = chargeCurrentToAxpReg(settingChargeCurrentMa);
   writeRegI2C(Wire, AXP2101_ADDR, 0x62, (uint8_t)((reg62 & 0xE0) | (iccCode & 0x1F)));
 
   uint8_t ldoEn = readRegI2C(Wire, AXP2101_ADDR, 0x90);
-  // Base always-on rails: ALDO1(0x01), ALDO2(0x02), ALDO3(0x04), BLDO2(0x20), DLDO1(0x80) = 0xA7
-  ldoEn = (uint8_t)(ldoEn | 0xA7);
-  if (settingPowerGps)  ldoEn |= 0x10;  else ldoEn &= (uint8_t)(~0x10); // BLDO1 (bit 4): GPS
-  if (settingPowerLora) ldoEn |= 0x08;  else ldoEn &= (uint8_t)(~0x08); // ALDO4 (bit 3): LoRa
+  // Active base rails: ALDO1(0x01), ALDO2(0x02), ALDO3(0x04), BLDO2(0x20) = 0x27
+  // DLDO1(0x80) MAX98357A speaker amp is kept OFF unless an audio program is actively playing
+  ldoEn = (uint8_t)(ldoEn | AXP2101_LDO0_ACTIVE_BASE_MASK);
+  if (settingPowerGps)  ldoEn |= AXP2101_LDO0_BLDO1_GPS_MASK;  else ldoEn &= (uint8_t)(~AXP2101_LDO0_BLDO1_GPS_MASK);  // BLDO1 (bit 4): GPS
+  if (settingPowerLora) ldoEn |= AXP2101_LDO0_ALDO4_LORA_MASK; else ldoEn &= (uint8_t)(~AXP2101_LDO0_ALDO4_LORA_MASK); // ALDO4 (bit 3): LoRa
+  bool needSpeaker = (sndGenPlaying || alertAudioPlaying || cwAudioPlaying);
+  if (needSpeaker)      ldoEn |= AXP2101_LDO0_DLDO1_SPK_MASK;  else ldoEn &= (uint8_t)(~AXP2101_LDO0_DLDO1_SPK_MASK);  // DLDO1 (bit 7): Speaker
+  speakerAmpPowered = needSpeaker;
   writeRegI2C(Wire, AXP2101_ADDR, 0x90, ldoEn);
 }
 
-// Initialize AXP2101 PMU (enable power rails, apply saved charge current and GPS BLDO1 / LoRa ALDO4 enables)
+// Apply AXP2101 LDO rails for BL_STATE_OFF Light Sleep:
+// Turn OFF DLDO1 (speaker amp), ALDO4 (LoRa), and BLDO2 (haptic rail),
+// while never disabling GPS (BLDO1) if GPS is enabled in Settings.
+void applyAxp2101LightSleepRails() {
+  uint8_t ldoEn = readRegI2C(Wire, AXP2101_ADDR, 0x90);
+  ldoEn = (uint8_t)(ldoEn | AXP2101_LDO0_CORE_MASK);
+  ldoEn &= (uint8_t)(~(AXP2101_LDO0_DLDO1_SPK_MASK | AXP2101_LDO0_ALDO4_LORA_MASK | AXP2101_LDO0_BLDO2_MASK));
+  if (settingPowerGps) {
+    ldoEn |= AXP2101_LDO0_BLDO1_GPS_MASK; // Preserve GPS BLDO1 during BL_STATE_OFF when enabled
+  } else {
+    ldoEn &= (uint8_t)(~AXP2101_LDO0_BLDO1_GPS_MASK);
+  }
+  speakerAmpPowered = false;
+  writeRegI2C(Wire, AXP2101_ADDR, 0x90, ldoEn);
+}
+
+// Initialize AXP2101 PMU (configure voltages, charge current, active LDOs; DLDO1 speaker stays OFF until needed)
 void initAXP2101() {
   writeRegI2C(Wire, AXP2101_ADDR, 0x92, 0x1C); // ALDO1: 3.3V (+3V3)
   writeRegI2C(Wire, AXP2101_ADDR, 0x93, 0x1C); // ALDO2: 3.3V (LCD_VDD backlight)
   writeRegI2C(Wire, AXP2101_ADDR, 0x94, 0x1C); // ALDO3: 3.3V (LDO3)
   writeRegI2C(Wire, AXP2101_ADDR, 0x95, 0x1C); // ALDO4: 3.3V (LoRa VDD)
   writeRegI2C(Wire, AXP2101_ADDR, 0x96, 0x1C); // BLDO1: 3.3V (GPS VDD)
-  writeRegI2C(Wire, AXP2101_ADDR, 0x97, 0x1C); // BLDO2: 3.3V (LDO5 -> DRV2605L EN and AVDD for BMA423/LCD/Touch)
-  writeRegI2C(Wire, AXP2101_ADDR, 0x99, 0x1C); // DLDO1: 3.3V (SPK_VDD)
+  writeRegI2C(Wire, AXP2101_ADDR, 0x97, 0x1C); // BLDO2: 3.3V (LDO5 -> DRV2605L EN)
+  writeRegI2C(Wire, AXP2101_ADDR, 0x99, 0x1C); // DLDO1: 3.3V (SPK_VDD, gated on demand)
 
   applyAxp2101PowerSettings();
 
@@ -1956,7 +2100,25 @@ void initAXP2101() {
   delay(50);
 }
 
-// Initialize DRV2605L haptic driver for 3.0V ERM 0827 motor (VC0827B005F) and buzz for 500 ms
+// Configure DRV2605L registers silently in Standby (used after BLDO2 power-cycle on Light Sleep wake)
+void reinitDRV2605LAfterSleep() {
+  for (uint8_t attempt = 0; attempt < 5; attempt++) {
+    Wire.beginTransmission(DRV2605_ADDR);
+    if (Wire.endTransmission() == 0) break;
+    delay(5);
+  }
+  writeRegI2C(Wire, DRV2605_ADDR, 0x01, 0x00); // Exit Standby
+  writeRegI2C(Wire, DRV2605_ADDR, 0x02, 0x00); // RTP_INPUT = 0
+  writeRegI2C(Wire, DRV2605_ADDR, 0x16, 0x8E); // RATED_VOLTAGE = 3.0 V
+  writeRegI2C(Wire, DRV2605_ADDR, 0x17, 0xFF); // OD_CLAMP = max swing
+  writeRegI2C(Wire, DRV2605_ADDR, 0x1A, 0x36); // ERM motor
+  writeRegI2C(Wire, DRV2605_ADDR, 0x1B, 0x93); // STARTUP_BOOST = 1
+  writeRegI2C(Wire, DRV2605_ADDR, 0x1C, 0xF5); // BIDIR_INPUT = 1
+  writeRegI2C(Wire, DRV2605_ADDR, 0x1D, 0xB0); // ERM_OPEN_LOOP = 1
+  writeRegI2C(Wire, DRV2605_ADDR, 0x01, 0x40); // Return to Standby
+}
+
+// Initialize DRV2605L haptic driver for 3.0V ERM 0827 motor (VC0827B005F) and buzz for 250 ms
 void initDRV2605L() {
   // Wait for DRV2605L readiness on I2C bus after enabling BLDO2 rail
   for (uint8_t attempt = 0; attempt < 10; attempt++) {
@@ -2037,10 +2199,75 @@ void updateTouchVibration() {
   }
 }
 
-// Initialize and configure BMA423 accelerometer for step counter
+// Configure BMA423 INT1 (GPIO14) interrupt routing according to Wake-up condition settings
+void configureBma423WakeInterrupt() {
+  if (!bma423Ready) return;
+  // Disable advanced power save briefly while modifying interrupt registers
+  writeRegI2C(Wire, bma423Addr, BMA423_REG_PWR_CONF, 0x00);
+  delay(2);
+  // INT_LATCH (0x55) = 0x00 (non-latched pulse so Light Sleep does not re-trigger continuously)
+  writeRegI2C(Wire, bma423Addr, BMA423_REG_INT_LATCH, 0x00);
+  if (settingWakeOnBma423) {
+    // INT1_IO_CTRL (0x53): output_en=1 (bit 3), push-pull (bit 2=0), active-LOW (bit 1=0), level (bit 0=0) -> 0x08
+    writeRegI2C(Wire, bma423Addr, BMA423_REG_INT1_IO_CTRL, 0x08);
+    // INT_MAP_1 (0x56): route step_cntr (0x02), tilt (0x08), wakeup/double-tap (0x10), any-motion (0x20) to INT1
+    writeRegI2C(Wire, bma423Addr, BMA423_REG_INT_MAP_1, bma423HwPedometerReady ? 0x3A : 0x00);
+  } else {
+    writeRegI2C(Wire, bma423Addr, BMA423_REG_INT_MAP_1, 0x00);
+    writeRegI2C(Wire, bma423Addr, BMA423_REG_INT1_IO_CTRL, 0x00);
+  }
+  // Clear any pending interrupt flags
+  (void)readRegI2C(Wire, bma423Addr, BMA423_REG_INT_STATUS_0);
+  // Re-enable BMA423 advanced low-power duty cycling
+  writeRegI2C(Wire, bma423Addr, BMA423_REG_PWR_CONF, 0x01);
+}
+
+// Read 32-bit hardware step counter directly from BMA423 STEP_COUNTER_0..3 (0x1E..0x21)
+uint32_t readBma423HardwareSteps() {
+  if (!bma423Ready) return bma423LastHwSteps;
+  Wire.beginTransmission(bma423Addr);
+  Wire.write(BMA423_REG_STEP_COUNTER_0);
+  if (Wire.endTransmission(false) != 0) return bma423LastHwSteps;
+  if (Wire.requestFrom(bma423Addr, (uint8_t)4) != 4) return bma423LastHwSteps;
+  uint32_t b0 = Wire.read();
+  uint32_t b1 = Wire.read();
+  uint32_t b2 = Wire.read();
+  uint32_t b3 = Wire.read();
+  return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
+}
+
+// Synchronize global stepCount from BMA423 built-in hardware pedometer
+void syncBma423HardwareSteps() {
+  if (!bma423Ready || !bma423HwPedometerReady) return;
+  uint32_t rawHwSteps = readBma423HardwareSteps();
+  if (rawHwSteps < bma423HwStepZeroOffset) {
+    bma423HwStepZeroOffset = 0;
+  }
+  bma423LastHwSteps = rawHwSteps - bma423HwStepZeroOffset;
+  stepCount = stepCountBase + bma423LastHwSteps;
+}
+
+// Reset BMA423 built-in hardware step counter and persisted base offset
+void resetBma423HardwareSteps() {
+  stepCount = 0;
+  stepCountBase = 0;
+  bma423LastHwSteps = 0;
+  bma423HwStepZeroOffset = 0;
+#if HAS_SENSORLIB_BMA423
+  if (bma423Ready && bma423HwPedometerReady) {
+    bma423Sensor.resetPedometer();
+  }
+#endif
+  if (bma423Ready && bma423HwPedometerReady) {
+    bma423HwStepZeroOffset = readBma423HardwareSteps();
+  }
+}
+
+// Initialize and configure BMA423 accelerometer and built-in hardware step counter
 void initBMA423() {
   uint8_t candidates[2] = {BMA423_ADDR_LOW, BMA423_ADDR_HIGH};
   bma423Ready = false;
+  bma423HwPedometerReady = false;
 
   for (uint8_t i = 0; i < 2; i++) {
     uint8_t chipId = readRegI2C(Wire, candidates[i], 0x00);
@@ -2055,14 +2282,40 @@ void initBMA423() {
     return;
   }
 
-  writeRegI2C(Wire, bma423Addr, 0x7E, 0xB6);
-  delay(20);
-  writeRegI2C(Wire, bma423Addr, 0x7C, 0x00);
+#if HAS_SENSORLIB_BMA423
+  // Load official Bosch BMA423 config stream via SensorLib and enable built-in hardware pedometer
+  if (bma423Sensor.begin(Wire, bma423Addr, I2C_SDA_PIN, I2C_SCL_PIN)) {
+    bma423Sensor.enablePedometer(true);
+    bma423Sensor.resetPedometer();
+    uint8_t internalStatus = readRegI2C(Wire, bma423Addr, BMA423_REG_INTERNAL_STATUS);
+    if ((internalStatus & 0x0F) == 0x01) {
+      bma423HwPedometerReady = true;
+    }
+  }
+#endif
+
+  if (!bma423HwPedometerReady) {
+    // Check if BMA423 ASIC feature engine is already initialized in RAM across warm reset
+    uint8_t internalStatus = readRegI2C(Wire, bma423Addr, BMA423_REG_INTERNAL_STATUS);
+    if ((internalStatus & 0x0F) == 0x01) {
+      bma423HwPedometerReady = true;
+    } else {
+      // Soft-reset and configure low-power 50 Hz accelerometer mode
+      writeRegI2C(Wire, bma423Addr, BMA423_REG_CMD, 0xB6);
+      delay(20);
+    }
+  }
+
+  // Configure 50 Hz ODR (0xA7), +/-4g range (0x01), accelerometer enabled (0x04)
+  writeRegI2C(Wire, bma423Addr, BMA423_REG_PWR_CONF, 0x00);
   delay(2);
   writeRegI2C(Wire, bma423Addr, 0x40, 0xA7);
   writeRegI2C(Wire, bma423Addr, 0x41, 0x01);
-  writeRegI2C(Wire, bma423Addr, 0x7D, 0x04);
+  writeRegI2C(Wire, bma423Addr, BMA423_REG_PWR_CTRL, 0x04);
   delay(5);
+
+  bma423LastHwSteps = bma423HwPedometerReady ? readBma423HardwareSteps() : 0;
+  configureBma423WakeInterrupt();
 }
 
 // Read internal BMA423 temperature sensor (register 0x22: int8_t + 23 C, 0x80 = invalid)
@@ -2101,13 +2354,30 @@ void recordAccelSample(float ax, float ay, float az) {
   }
 }
 
-// Background BMA423 polling (50 Hz) and step detection via dynamic acceleration
+// Background BMA423 step counter (hardware pedometer when active, low-power fallback otherwise)
 void updateStepCounter() {
   if (!bma423Ready || currentScreen == SCREEN_ACCEL_SPEC) return;
 
   uint32_t now = millis();
-  if (now - lastStepPollMs < 20UL) return;
-  lastStepPollMs = now;
+
+  // When BMA423 built-in hardware pedometer is active, sync steps at 1 Hz without 50 Hz CPU polling
+  if (bma423HwPedometerReady) {
+    if (now - lastHwStepSyncMs >= 1000UL) {
+      lastHwStepSyncMs = now;
+      syncBma423HardwareSteps();
+      if (now - lastStepSaveMs >= STEP_SAVE_INTERVAL_MS) {
+        saveStepCountToFlash(false);
+      }
+    }
+    // Only poll raw XYZ registers at high rate when Accel/Inclinometer screens require live vectors
+    bool needLiveXyz = (currentScreen == SCREEN_ACCEL || currentScreen == SCREEN_INCLINOMETER);
+    uint32_t xyzPollPeriod = needLiveXyz ? 25UL : 1000UL;
+    if (now - lastStepPollMs < xyzPollPeriod) return;
+    lastStepPollMs = now;
+  } else {
+    if (now - lastStepPollMs < 20UL) return;
+    lastStepPollMs = now;
+  }
 
   Wire.beginTransmission(bma423Addr);
   Wire.write(0x12);
@@ -2146,23 +2416,25 @@ void updateStepCounter() {
   inclAngleX = -atan2f(inclFiltGy, sqrtf(inclFiltGx * inclFiltGx + inclFiltGz * inclFiltGz)) * RAD_TO_DEG;
   inclAngleY = atan2f(inclFiltGx, sqrtf(inclFiltGy * inclFiltGy + inclFiltGz * inclFiltGz)) * RAD_TO_DEG;
 
-  float mag = sqrtf(gx * gx + gy * gy + gz * gz);
+  if (!bma423HwPedometerReady) {
+    float mag = sqrtf(gx * gx + gy * gy + gz * gz);
 
-  stepBaselineMag = stepBaselineMag * 0.96f + mag * 0.04f;
-  stepFilteredMag = stepFilteredMag * 0.65f + mag * 0.35f;
-  float dynAcc = stepFilteredMag - stepBaselineMag;
+    stepBaselineMag = stepBaselineMag * 0.96f + mag * 0.04f;
+    stepFilteredMag = stepFilteredMag * 0.65f + mag * 0.35f;
+    float dynAcc = stepFilteredMag - stepBaselineMag;
 
-  if (!stepPeakActive && dynAcc > 0.18f && (now - lastStepDetectMs >= 280UL)) {
-    stepCount++;
-    stepPeakActive = true;
-    lastStepDetectMs = now;
-  } else if (stepPeakActive && dynAcc < 0.06f) {
-    stepPeakActive = false;
-  }
+    if (!stepPeakActive && dynAcc > 0.18f && (now - lastStepDetectMs >= 280UL)) {
+      stepCount++;
+      stepPeakActive = true;
+      lastStepDetectMs = now;
+    } else if (stepPeakActive && dynAcc < 0.06f) {
+      stepPeakActive = false;
+    }
 
-  // Automatically save step count to Flash every 10 minutes
-  if (now - lastStepSaveMs >= STEP_SAVE_INTERVAL_MS) {
-    saveStepCountToFlash(false);
+    // Automatically save step count to Flash every 10 minutes
+    if (now - lastStepSaveMs >= STEP_SAVE_INTERVAL_MS) {
+      saveStepCountToFlash(false);
+    }
   }
 }
 
@@ -2281,13 +2553,80 @@ uint8_t touchSensitivityToThGroup(uint8_t sensVal) {
   return sensVal;
 }
 
+// Put FT6336U into full-rate Active Mode using saved sensitivity from Flash
+void setTouchActiveMode() {
+  uint8_t thGroup = touchSensitivityToThGroup(settingTouchSensitivity);
+  writeRegI2C(Wire1, FT6336_ADDR, FT6336_REG_PMODE, FT6336_PMODE_ACTIVE); // PMODE (0xA5): Active Mode
+  delay(2);
+  writeRegI2C(Wire1, FT6336_ADDR, 0x80, thGroup);                         // THGROUP (0x80): sensitivity (30..80)
+  writeRegI2C(Wire1, FT6336_ADDR, 0x85, 0xA0);                            // THDIFF: touch point jitter filter
+  writeRegI2C(Wire1, FT6336_ADDR, FT6336_REG_CTRL, 0x00);                 // CTRL (0x86): stay in active mode
+  writeRegI2C(Wire1, FT6336_ADDR, FT6336_REG_PERIODACTIVE, 0x06);         // PERIODACTIVE (0x88): 60 Hz scan
+  writeRegI2C(Wire1, FT6336_ADDR, FT6336_REG_G_MODE, 0x00);               // G_MODE (0xA4): level trigger on TOUCH_INT
+  touchInMonitorMode = false;
+}
+
+// Put FT6336U into low-power Monitor Mode while preserving TOUCH_INT_PIN pulses for 2x/3x tap wake
+void setTouchMonitorMode() {
+  uint8_t thGroup = touchSensitivityToThGroup(settingTouchSensitivity);
+  writeRegI2C(Wire1, FT6336_ADDR, 0x80, thGroup);
+  writeRegI2C(Wire1, FT6336_ADDR, FT6336_REG_G_MODE, 0x00);               // G_MODE (0xA4): LOW while finger touches
+  writeRegI2C(Wire1, FT6336_ADDR, FT6336_REG_TIMEENTERMONITOR, 0x01);     // Enter monitor after 1 s idle
+  writeRegI2C(Wire1, FT6336_ADDR, FT6336_REG_PERIODMONITOR, 0x19);        // Monitor scan period (low power, ~40 Hz)
+  writeRegI2C(Wire1, FT6336_ADDR, FT6336_REG_CTRL, 0x01);                 // CTRL (0x86): allow switch to monitor
+  writeRegI2C(Wire1, FT6336_ADDR, FT6336_REG_PMODE, FT6336_PMODE_MONITOR);// PMODE (0xA5): Monitor Mode (0x01)
+  touchInMonitorMode = true;
+}
+
+// Put FT6336U into deepest Hibernate Mode when touch wake-up is disabled in Settings
+void setTouchHibernateMode() {
+  writeRegI2C(Wire1, FT6336_ADDR, FT6336_REG_PMODE, FT6336_PMODE_HIBERNATE); // PMODE (0xA5): Hibernate (0x03)
+  touchInMonitorMode = true;
+}
+
 // Initialize FT6236 / FT6336U touchscreen controller using saved sensitivity from Flash
 void initTouchScreen() {
-  uint8_t thGroup = touchSensitivityToThGroup(settingTouchSensitivity);
-  writeRegI2C(Wire1, FT6336_ADDR, 0x80, thGroup); // THGROUP (0x80): touch detection threshold (30..80, default 50)
-  writeRegI2C(Wire1, FT6336_ADDR, 0x85, 0xA0);    // THDIFF: touch point jitter filter
-  writeRegI2C(Wire1, FT6336_ADDR, 0x86, 0x00);    // CTRL: remain in active mode
-  writeRegI2C(Wire1, FT6336_ADDR, 0x88, 0x06);    // PERIODACTIVE: 60 Hz scan rate
+  setTouchActiveMode();
+}
+
+// Detect 2 or 3 consecutive taps via TOUCH_INT_PIN (IO16) while FT6336U is in Monitor Mode
+bool detectMultiTapOnTouchInt(uint8_t requiredTaps) {
+  if (requiredTaps != 3) requiredTaps = 2;
+  uint8_t tapCount = 1; // First tap already triggered the GPIO wakeup (TOUCH_INT_PIN == LOW)
+
+  while (tapCount < requiredTaps) {
+    // 1. Wait for current tap finger release (TOUCH_INT_PIN -> HIGH)
+    uint32_t pressStart = millis();
+    while (digitalRead(TOUCH_INT_PIN) == LOW) {
+      if (millis() - pressStart > DOUBLE_TAP_MAX_MS) {
+        return false; // Long press / pocket contact is not a tap
+      }
+      delay(4);
+    }
+    // Release debounce
+    delay(20);
+
+    // 2. Wait for next tap press edge (TOUCH_INT_PIN -> LOW) within DOUBLE_TAP_MAX_MS
+    uint32_t gapStart = millis();
+    bool gotNextTap = false;
+    while (millis() - gapStart <= DOUBLE_TAP_MAX_MS) {
+      if (digitalRead(TOUCH_INT_PIN) == LOW) {
+        // Confirm stable touch pulse (>= 10 ms)
+        delay(10);
+        if (digitalRead(TOUCH_INT_PIN) == LOW) {
+          gotNextTap = true;
+          break;
+        }
+      }
+      delay(4);
+    }
+    if (!gotNextTap) {
+      return false;
+    }
+    tapCount++;
+  }
+
+  return true;
 }
 
 bool getTouchPoint(int16_t &tx, int16_t &ty) {
@@ -4934,8 +5273,8 @@ void drawStepsScreen() {
   canvas.setTextDatum(bottom_center);
   canvas.setFont(&fonts::Font0);
   if (bma423Ready) {
-    canvas.setTextColor(COLOR_SUBTEXT, COLOR_BG);
-    canvas.drawString("BMA423 Active", 120, 228);
+    canvas.setTextColor(bma423HwPedometerReady ? COLOR_GREEN : COLOR_SUBTEXT, COLOR_BG);
+    canvas.drawString(bma423HwPedometerReady ? "BMA423 HW Pedometer" : "BMA423 Active", 120, 228);
   } else {
     canvas.setTextColor(COLOR_RED, COLOR_BG);
     canvas.drawString("BMA423 Error", 120, 228);
@@ -5208,6 +5547,7 @@ uint8_t findDisplayTimeOptionIdx(uint16_t sec) {
 }
 
 void loadWatchSettings() {
+  settingWifiEnabled       = true;
   settingWifiAutoConnect   = true;
   settingDisplayBrightness = 94;
   settingDisplayLightSec   = 30;
@@ -5217,8 +5557,12 @@ void loadWatchSettings() {
   settingChargeCurrentMa   = 200;
   settingPowerGps          = true;
   settingPowerLora         = true;
+  settingWakeOnTouch       = true;
+  settingWakeOnBma423      = true;
+  settingWakeOnButton      = true;
 
   if (!settingsPrefs.begin("watch_cfg", true)) return;
+  settingWifiEnabled     = settingsPrefs.getBool("wifi_en", true);
   settingWifiAutoConnect = settingsPrefs.getBool("wifi_auto", true);
   uint8_t bri = settingsPrefs.getUChar("disp_bri", 94);
   if (bri < BRIGHTNESS_MIN_PCT) bri = BRIGHTNESS_MIN_PCT;
@@ -5241,8 +5585,15 @@ void loadWatchSettings() {
   settingChargeCurrentMa = chgMa;
   settingPowerGps        = settingsPrefs.getBool("pwr_gps", true);
   settingPowerLora       = settingsPrefs.getBool("pwr_lora", true);
+  settingWakeOnTouch     = settingsPrefs.getBool("wake_tch", true);
+  settingWakeOnBma423    = settingsPrefs.getBool("wake_bma", true);
+  settingWakeOnButton    = settingsPrefs.getBool("wake_btn", true);
+  if (!settingWakeOnTouch && !settingWakeOnBma423 && !settingWakeOnButton) {
+    settingWakeOnButton = true;
+  }
 
   stepCount          = settingsPrefs.getULong("step_cnt", 0);
+  stepCountBase      = stepCount;
   lastSavedStepCount = stepCount;
 
   weatherAutoLocate      = settingsPrefs.getBool("w_auto", true);
@@ -5278,7 +5629,11 @@ void saveWatchSettings() {
       settingChargeCurrentMa != 300 && settingChargeCurrentMa != 400) {
     settingChargeCurrentMa = 200;
   }
+  if (!settingWakeOnTouch && !settingWakeOnBma423 && !settingWakeOnButton) {
+    settingWakeOnButton = true;
+  }
   if (!settingsPrefs.begin("watch_cfg", false)) return;
+  settingsPrefs.putBool("wifi_en", settingWifiEnabled);
   settingsPrefs.putBool("wifi_auto", settingWifiAutoConnect);
   settingsPrefs.putUChar("disp_bri", settingDisplayBrightness);
   settingsPrefs.putUShort("disp_sec", settingDisplayLightSec);
@@ -5288,6 +5643,9 @@ void saveWatchSettings() {
   settingsPrefs.putUShort("chg_ma", settingChargeCurrentMa);
   settingsPrefs.putBool("pwr_gps", settingPowerGps);
   settingsPrefs.putBool("pwr_lora", settingPowerLora);
+  settingsPrefs.putBool("wake_tch", settingWakeOnTouch);
+  settingsPrefs.putBool("wake_bma", settingWakeOnBma423);
+  settingsPrefs.putBool("wake_btn", settingWakeOnButton);
   settingsPrefs.putBool("w_auto", weatherAutoLocate);
   settingsPrefs.putUChar("w_city", weatherCityIdx);
 
@@ -5342,6 +5700,11 @@ void releaseBleRadioForWifi() {
 // Scan nearby Wi-Fi networks for Wi-Fi connect screen
 void scanWifiNetworks() {
   stopTouchVibrationNow();
+  if (!settingWifiEnabled) {
+    wifiScanCount = 0;
+    wifiScrollOffset = 0;
+    return;
+  }
   releaseBleRadioForWifi();
   wifiBgScanning = false;
   WiFi.scanDelete();
@@ -5408,6 +5771,11 @@ void scanWifiNetworks() {
 
 // Start connection to selected Wi-Fi network
 void startWifiConnectAttempt() {
+  if (!settingWifiEnabled) {
+    wifiConnectSuccess = false;
+    wifiView = WIFI_VIEW_RESULT;
+    return;
+  }
   releaseBleRadioForWifi();
   wifiBgScanning = false;
   WiFi.scanDelete();
@@ -5430,15 +5798,21 @@ void startWifiListConnectAttempt() {
   if (wifiListSelectedIdx < 0 || wifiListSelectedIdx >= savedWifiCount) return;
   const SavedWifiCred& cred = savedWifiList[wifiListSelectedIdx];
 
+  strncpy(wifiListConnectSsid, cred.ssid, 32);
+  wifiListConnectSsid[32] = '\0';
+
+  if (!settingWifiEnabled) {
+    wifiListConnectSuccess = false;
+    wifiListView = WIFILIST_VIEW_RESULT;
+    return;
+  }
+
   releaseBleRadioForWifi();
   wifiBgScanning = false;
   WiFi.scanDelete();
   WiFi.mode(WIFI_STA);
   WiFi.disconnect();
   delay(40);
-
-  strncpy(wifiListConnectSsid, cred.ssid, 32);
-  wifiListConnectSsid[32] = '\0';
 
   if (cred.pass[0] != '\0') {
     WiFi.begin(cred.ssid, cred.pass);
@@ -5452,6 +5826,10 @@ void startWifiListConnectAttempt() {
 
 // Start asynchronous Wi-Fi scan for channel analyzer (channels 1..11)
 void startWifiAnalyzerScan() {
+  if (!settingWifiEnabled) {
+    wifiAnalyzerScanning = false;
+    return;
+  }
   releaseBleRadioForWifi();
   wifiBgScanning = false;
   WiFi.scanDelete();
@@ -5479,6 +5857,10 @@ void IRAM_ATTR wifiJamPromiscuousCb(void* buf, wifi_promiscuous_pkt_type_t type)
 
 // Start Wi-Fi jam detector (hop channels 1..11 in promiscuous mode)
 void startWifiJamDetect() {
+  if (!settingWifiEnabled) {
+    wifiJamActive = false;
+    return;
+  }
   releaseBleRadioForWifi();
   wifiBgScanning = false;
   WiFi.scanDelete();
@@ -5510,9 +5892,34 @@ void stopWifiJamDetect() {
   esp_wifi_set_promiscuous(false);
   esp_wifi_set_promiscuous_rx_cb(nullptr);
   wifiJamActive = false;
-  if (wifiJamWasConnected) {
+  if (wifiJamWasConnected && settingWifiEnabled) {
     WiFi.reconnect();
-    wifiJamWasConnected = false;
+  }
+  wifiJamWasConnected = false;
+}
+
+// Apply global Wi-Fi enabled/disabled power state immediately
+void applyWifiPowerState() {
+  if (!settingWifiEnabled) {
+    if (wifiJamActive) {
+      stopWifiJamDetect();
+    }
+    if (hostsScanRunning) {
+      stopHostsScan();
+    }
+    wifiAnalyzerScanning = false;
+    wifiBgScanning = false;
+    WiFi.scanDelete();
+    WiFi.disconnect(true, false);
+    esp_wifi_stop();
+    WiFi.mode(WIFI_OFF);
+    wifiInfoConnected = false;
+  } else {
+    WiFi.mode(WIFI_STA);
+    WiFi.setSleep(false);
+    if (settingWifiAutoConnect) {
+      lastWifiAutoCheckMs = 0;
+    }
   }
 }
 
@@ -5734,6 +6141,14 @@ void renderCurrentScreen();
 
 // Background Wi-Fi connection monitoring and 1-minute auto-connect to saved networks
 void updateWifiAutoAndConnect() {
+  if (!settingWifiEnabled) {
+    if (wifiBgScanning) {
+      WiFi.scanDelete();
+      wifiBgScanning = false;
+    }
+    wifiAnalyzerScanning = false;
+    return;
+  }
   uint32_t now = millis();
 
   // 1. Monitor active connection attempt from Wi-Fi connect screen
@@ -6397,18 +6812,23 @@ void drawSettingsScreen() {
   drawTopLeftCloseIcon();
 
   if (settingsView == SETTINGS_VIEW_LIST) {
-    // Settings list (7 items) with vertical scrolling via right-side triangle buttons
+    // Settings list (8 items) with vertical scrolling via right-side triangle buttons
     const char* itemTitles[SETTINGS_ITEM_COUNT] = {
-      "Wi-Fi autoconnect",
+      "Wi-Fi power",
       "Display light intensity",
       "Display light time",
       "Touch vibration",
       "Touch sensitivity",
       "Charge current",
-      "Power settings"
+      "Power settings",
+      "Wake-up condition"
     };
-    char valBufs[SETTINGS_ITEM_COUNT][22];
-    snprintf(valBufs[0], sizeof(valBufs[0]), "%s", settingWifiAutoConnect ? "ON" : "OFF");
+    char valBufs[SETTINGS_ITEM_COUNT][24];
+    if (!settingWifiEnabled) {
+      snprintf(valBufs[0], sizeof(valBufs[0]), "OFF (Disabled)");
+    } else {
+      snprintf(valBufs[0], sizeof(valBufs[0]), "ON / Auto:%s", settingWifiAutoConnect ? "ON" : "OFF");
+    }
     snprintf(valBufs[1], sizeof(valBufs[1]), "%u%%", (unsigned)settingDisplayBrightness);
     if (settingDisplayLightSec == 0) {
       snprintf(valBufs[2], sizeof(valBufs[2]), "0s (ON)");
@@ -6421,6 +6841,10 @@ void drawSettingsScreen() {
     snprintf(valBufs[5], sizeof(valBufs[5]), "%u mA (AXP2101)", (unsigned)settingChargeCurrentMa);
     snprintf(valBufs[6], sizeof(valBufs[6]), "GPS:%s LoRa:%s",
              settingPowerGps ? "ON" : "OFF", settingPowerLora ? "ON" : "OFF");
+    snprintf(valBufs[7], sizeof(valBufs[7]), "TCH:%s BMA:%s BTN:%s",
+             settingWakeOnTouch ? "ON" : "OFF",
+             settingWakeOnBma423 ? "ON" : "OFF",
+             settingWakeOnButton ? "ON" : "OFF");
 
     uint8_t maxOffset = (SETTINGS_ITEM_COUNT > SETTINGS_VISIBLE_ROWS)
                           ? (uint8_t)(SETTINGS_ITEM_COUNT - SETTINGS_VISIBLE_ROWS)
@@ -6440,12 +6864,13 @@ void drawSettingsScreen() {
       canvas.drawString(itemTitles[itemIdx], 12, ry + 6);
 
       uint16_t valCol = COLOR_ACCENT;
-      if (itemIdx == 0) valCol = settingWifiAutoConnect ? COLOR_GREEN : COLOR_SUBTEXT;
+      if (itemIdx == 0) valCol = settingWifiEnabled ? COLOR_GREEN : COLOR_SUBTEXT;
       else if (itemIdx == 2 && settingDisplayLightSec == 0) valCol = COLOR_GREEN;
       else if (itemIdx == 3) valCol = settingTouchVibration ? COLOR_GREEN : COLOR_SUBTEXT;
       else if (itemIdx == 4) valCol = COLOR_ACCENT;
       else if (itemIdx == 5) valCol = COLOR_WARN;
       else if (itemIdx == 6) valCol = (settingPowerGps || settingPowerLora) ? COLOR_GREEN : COLOR_SUBTEXT;
+      else if (itemIdx == 7) valCol = (settingWakeOnTouch || settingWakeOnBma423 || settingWakeOnButton) ? COLOR_GREEN : COLOR_RED;
 
       canvas.setTextDatum(bottom_left);
       canvas.setFont(&fonts::Font0);
@@ -6481,26 +6906,48 @@ void drawSettingsScreen() {
   }
 
   if (settingsView == SETTINGS_VIEW_WIFI_AUTO) {
-    // Wi-Fi auto-connect toggle + OK / Cancel
+    // Wi-Fi power settings: global "Wi-Fi enabled" + "Wi-Fi autoconnect" toggles + OK / Cancel
     canvas.setTextDatum(middle_center);
     canvas.setFont(&fonts::Font2);
     canvas.setTextColor(COLOR_TEXT, COLOR_BG);
-    canvas.drawString("Wi-Fi autoconnect", 120, 52);
+    canvas.drawString("Wi-Fi power", 120, 46);
 
-    // Centered toggle switch
-    int16_t swX = 72, swY = 82, swW = 96, swH = 44;
-    uint16_t trackFill = editWifiAutoConnect ? COLOR_HEX_ACTIVE : COLOR_TOPBAR;
-    uint16_t trackBord = editWifiAutoConnect ? COLOR_GREEN : COLOR_SUBTEXT;
-    canvas.fillRoundRect(swX, swY, swW, swH, 22, trackFill);
-    canvas.drawRoundRect(swX, swY, swW, swH, 22, trackBord);
-
-    int16_t knobX = editWifiAutoConnect ? (swX + swW - 22) : (swX + 22);
-    canvas.fillCircle(knobX, swY + 22, 16, editWifiAutoConnect ? COLOR_GREEN : COLOR_SUBTEXT);
-    canvas.drawCircle(knobX, swY + 22, 16, COLOR_TEXT);
-
+    // Row 1: Wi-Fi enabled (global radio power)
+    int16_t r1Y = 64;
+    canvas.fillRoundRect(12, r1Y, 216, 44, 8, COLOR_HEX_FILL);
+    canvas.drawRoundRect(12, r1Y, 216, 44, 8, editWifiEnabled ? COLOR_GREEN : COLOR_HEX_BORDER);
+    canvas.setTextDatum(top_left);
     canvas.setFont(&fonts::Font2);
-    canvas.setTextColor(editWifiAutoConnect ? COLOR_GREEN : COLOR_SUBTEXT, COLOR_BG);
-    canvas.drawString(editWifiAutoConnect ? "ENABLED" : "DISABLED", 120, 148);
+    canvas.setTextColor(COLOR_TEXT, COLOR_HEX_FILL);
+    canvas.drawString("Wi-Fi enabled", 20, r1Y + 7);
+    canvas.setFont(&fonts::Font0);
+    canvas.setTextColor(editWifiEnabled ? COLOR_GREEN : COLOR_SUBTEXT, COLOR_HEX_FILL);
+    canvas.drawString(editWifiEnabled ? "Global radio ON" : "Global radio OFF", 20, r1Y + 29);
+
+    int16_t sw1X = 166, sw1Y = r1Y + 10;
+    canvas.fillRoundRect(sw1X, sw1Y, 52, 24, 12, editWifiEnabled ? COLOR_HEX_ACTIVE : COLOR_TOPBAR);
+    canvas.drawRoundRect(sw1X, sw1Y, 52, 24, 12, editWifiEnabled ? COLOR_GREEN : COLOR_SUBTEXT);
+    canvas.fillCircle(editWifiEnabled ? (sw1X + 40) : (sw1X + 12), sw1Y + 12, 9,
+                      editWifiEnabled ? COLOR_GREEN : COLOR_SUBTEXT);
+
+    // Row 2: Wi-Fi autoconnect
+    int16_t r2Y = 116;
+    bool autoEffOn = editWifiEnabled && editWifiAutoConnect;
+    canvas.fillRoundRect(12, r2Y, 216, 44, 8, COLOR_HEX_FILL);
+    canvas.drawRoundRect(12, r2Y, 216, 44, 8, autoEffOn ? COLOR_GREEN : COLOR_HEX_BORDER);
+    canvas.setTextDatum(top_left);
+    canvas.setFont(&fonts::Font2);
+    canvas.setTextColor(editWifiEnabled ? COLOR_TEXT : COLOR_SUBTEXT, COLOR_HEX_FILL);
+    canvas.drawString("Wi-Fi autoconnect", 20, r2Y + 7);
+    canvas.setFont(&fonts::Font0);
+    canvas.setTextColor(autoEffOn ? COLOR_GREEN : COLOR_SUBTEXT, COLOR_HEX_FILL);
+    canvas.drawString(editWifiAutoConnect ? "Auto-join ON" : "Auto-join OFF", 20, r2Y + 29);
+
+    int16_t sw2X = 166, sw2Y = r2Y + 10;
+    canvas.fillRoundRect(sw2X, sw2Y, 52, 24, 12, autoEffOn ? COLOR_HEX_ACTIVE : COLOR_TOPBAR);
+    canvas.drawRoundRect(sw2X, sw2Y, 52, 24, 12, autoEffOn ? COLOR_GREEN : COLOR_SUBTEXT);
+    canvas.fillCircle(editWifiAutoConnect ? (sw2X + 40) : (sw2X + 12), sw2Y + 12, 9,
+                      autoEffOn ? COLOR_GREEN : COLOR_SUBTEXT);
   }
   else if (settingsView == SETTINGS_VIEW_BRIGHTNESS) {
     // Backlight intensity slider (5-100%, min 5%) + OK / Cancel
@@ -6731,6 +7178,47 @@ void drawSettingsScreen() {
     canvas.setTextColor(editPowerLora ? COLOR_GREEN : COLOR_SUBTEXT, editPowerLora ? COLOR_HEX_ACTIVE : COLOR_TOPBAR);
     canvas.drawString(editPowerLora ? "ON" : "OFF", editPowerLora ? 176 : 196, 144);
   }
+  else if (settingsView == SETTINGS_VIEW_WAKE_CONDITION) {
+    // Wake-up condition switches: Touch (IO16), BMA423 (IO14), Button (IO0) + OK / Cancel
+    canvas.setTextDatum(middle_center);
+    canvas.setFont(&fonts::Font2);
+    canvas.setTextColor(COLOR_TEXT, COLOR_BG);
+    canvas.drawString("Wake-up condition", 120, 38);
+
+    const char* wakeTitles[3] = {"Touch", "BMA423", "Button"};
+    const char* wakePins[3]   = {"TOUCH_INT (IO16)", "INT1 (IO14)", "BOOT (IO0)"};
+    bool wakeVals[3]          = {editWakeOnTouch, editWakeOnBma423, editWakeOnButton};
+
+    for (uint8_t r = 0; r < 3; r++) {
+      int16_t ry = (int16_t)(52 + r * 40);
+      bool on = wakeVals[r];
+      canvas.fillRoundRect(12, ry, 216, 36, 7, COLOR_HEX_FILL);
+      canvas.drawRoundRect(12, ry, 216, 36, 7, on ? COLOR_GREEN : COLOR_HEX_BORDER);
+      canvas.setTextDatum(top_left);
+      canvas.setFont(&fonts::Font2);
+      canvas.setTextColor(COLOR_TEXT, COLOR_HEX_FILL);
+      canvas.drawString(wakeTitles[r], 20, ry + 3);
+      canvas.setFont(&fonts::Font0);
+      canvas.setTextColor(COLOR_SUBTEXT, COLOR_HEX_FILL);
+      canvas.drawString(wakePins[r], 20, ry + 23);
+
+      // Compact pill toggle switch on right
+      canvas.fillRoundRect(158, ry + 6, 60, 24, 12, on ? COLOR_HEX_ACTIVE : COLOR_TOPBAR);
+      canvas.drawRoundRect(158, ry + 6, 60, 24, 12, on ? COLOR_GREEN : COLOR_SUBTEXT);
+      canvas.fillCircle(on ? 206 : 170, ry + 18, 8, on ? COLOR_GREEN : COLOR_SUBTEXT);
+      canvas.setTextDatum(middle_center);
+      canvas.setFont(&fonts::Font0);
+      canvas.setTextColor(on ? COLOR_GREEN : COLOR_SUBTEXT, on ? COLOR_HEX_ACTIVE : COLOR_TOPBAR);
+      canvas.drawString(on ? "ON" : "OFF", on ? 178 : 196, ry + 18);
+    }
+
+    if (!editWakeOnTouch && !editWakeOnBma423 && !editWakeOnButton) {
+      canvas.setTextDatum(middle_center);
+      canvas.setFont(&fonts::Font0);
+      canvas.setTextColor(COLOR_RED, COLOR_BG);
+      canvas.drawString("Select at least 1 wake source", 120, 173);
+    }
+  }
 
   // Shared Cancel (left) and OK (right) buttons for all Settings sub-screens
   canvas.fillRoundRect(10, 178, 104, 44, 8, COLOR_HEX_FILL);
@@ -6740,9 +7228,11 @@ void drawSettingsScreen() {
   canvas.setTextColor(COLOR_RED, COLOR_HEX_FILL);
   canvas.drawString("Cancel", 62, 200);
 
-  canvas.fillRoundRect(126, 178, 104, 44, 8, COLOR_HEX_ACTIVE);
-  canvas.drawRoundRect(126, 178, 104, 44, 8, COLOR_GREEN);
-  canvas.setTextColor(COLOR_TEXT, COLOR_HEX_ACTIVE);
+  bool okDisabled = (settingsView == SETTINGS_VIEW_WAKE_CONDITION &&
+                     !editWakeOnTouch && !editWakeOnBma423 && !editWakeOnButton);
+  canvas.fillRoundRect(126, 178, 104, 44, 8, okDisabled ? COLOR_TOPBAR : COLOR_HEX_ACTIVE);
+  canvas.drawRoundRect(126, 178, 104, 44, 8, okDisabled ? COLOR_HEX_BORDER : COLOR_GREEN);
+  canvas.setTextColor(okDisabled ? COLOR_SUBTEXT : COLOR_TEXT, okDisabled ? COLOR_TOPBAR : COLOR_HEX_ACTIVE);
   canvas.drawString("OK", 178, 200);
 }
 
@@ -8422,12 +8912,17 @@ void startSoundGenerator() {
   stopSoundSpectrometer();
   if (sndGenPlaying) return;
 
+  // Power ON MAX98357A speaker amplifier rail (AXP2101 DLDO1) only when audio starts
+  setSpeakerAmpPower(true);
+  delay(5);
+
 #if ESP_IDF_VERSION_MAJOR >= 5
   i2s_chan_config_t chanCfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_1, I2S_ROLE_MASTER);
   chanCfg.dma_desc_num  = 4;
   chanCfg.dma_frame_num = SND_GEN_CHUNK_SAMPLES;
   if (i2s_new_channel(&chanCfg, &sndGenTxChan, NULL) != ESP_OK) {
     sndGenTxChan = NULL;
+    updateSpeakerAmpPower();
     return;
   }
 
@@ -8448,6 +8943,7 @@ void startSoundGenerator() {
       i2s_channel_enable(sndGenTxChan) != ESP_OK) {
     i2s_del_channel(sndGenTxChan);
     sndGenTxChan = NULL;
+    updateSpeakerAmpPower();
     return;
   }
 #else
@@ -8473,6 +8969,7 @@ void startSoundGenerator() {
   pinCfg.data_in_num  = I2S_PIN_NO_CHANGE;
 
   if (i2s_driver_install(I2S_NUM_1, &i2sCfg, 0, NULL) != ESP_OK) {
+    updateSpeakerAmpPower();
     return;
   }
   i2s_set_pin(I2S_NUM_1, &pinCfg);
@@ -8493,12 +8990,16 @@ void startSoundGenerator() {
 #else
     i2s_driver_uninstall(I2S_NUM_1);
 #endif
+    updateSpeakerAmpPower();
   }
 }
 
-// Stop sound generation and release I2S_NUM_1
+// Stop sound generation, release I2S_NUM_1, and power OFF MAX98357A DLDO1
 void stopSoundGenerator() {
-  if (!sndGenPlaying && sndGenTaskHandle == NULL) return;
+  if (!sndGenPlaying && sndGenTaskHandle == NULL) {
+    updateSpeakerAmpPower();
+    return;
+  }
   sndGenTaskStopReq = true;
   sndGenPlaying     = false;
 
@@ -8516,6 +9017,7 @@ void stopSoundGenerator() {
 #else
   i2s_driver_uninstall(I2S_NUM_1);
 #endif
+  updateSpeakerAmpPower();
 }
 
 // FreeRTOS task synthesizing alarm/timer ringtone (Beep or Bell) via MAX98357A I2S
@@ -8595,6 +9097,10 @@ void startAlertRingtone(AlertRingtone tone) {
   stopSoundSpectrometer();
   stopAlertRingtone();
 
+  // Power ON MAX98357A speaker amplifier rail (AXP2101 DLDO1) for Alarm/Timer ringtone
+  setSpeakerAmpPower(true);
+  delay(5);
+
   activeAlertRingtone = tone;
 #if ESP_IDF_VERSION_MAJOR >= 5
   i2s_chan_config_t chanCfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_1, I2S_ROLE_MASTER);
@@ -8602,6 +9108,7 @@ void startAlertRingtone(AlertRingtone tone) {
   chanCfg.dma_frame_num = SND_GEN_CHUNK_SAMPLES;
   if (i2s_new_channel(&chanCfg, &alertTxChan, NULL) != ESP_OK) {
     alertTxChan = NULL;
+    updateSpeakerAmpPower();
     return;
   }
 
@@ -8619,6 +9126,7 @@ void startAlertRingtone(AlertRingtone tone) {
       i2s_channel_enable(alertTxChan) != ESP_OK) {
     i2s_del_channel(alertTxChan);
     alertTxChan = NULL;
+    updateSpeakerAmpPower();
     return;
   }
 #else
@@ -8644,6 +9152,7 @@ void startAlertRingtone(AlertRingtone tone) {
   pinCfg.data_in_num  = I2S_PIN_NO_CHANGE;
 
   if (i2s_driver_install(I2S_NUM_1, &i2sCfg, 0, NULL) != ESP_OK) {
+    updateSpeakerAmpPower();
     return;
   }
   i2s_set_pin(I2S_NUM_1, &pinCfg);
@@ -8664,11 +9173,15 @@ void startAlertRingtone(AlertRingtone tone) {
 #else
     i2s_driver_uninstall(I2S_NUM_1);
 #endif
+    updateSpeakerAmpPower();
   }
 }
 
 void stopAlertRingtone() {
-  if (!alertAudioPlaying && alertAudioTaskHandle == NULL) return;
+  if (!alertAudioPlaying && alertAudioTaskHandle == NULL) {
+    updateSpeakerAmpPower();
+    return;
+  }
   alertAudioStopReq = true;
   alertAudioPlaying = false;
 
@@ -8686,13 +9199,17 @@ void stopAlertRingtone() {
 #else
   i2s_driver_uninstall(I2S_NUM_1);
 #endif
+  updateSpeakerAmpPower();
 }
 
 // Wake display, start ringtone, and trigger vibration when alarm or timer fires
 void wakeDisplayForAlert(AlertRingtone tone) {
   uint32_t now = millis();
+  if (touchInMonitorMode) {
+    setTouchActiveMode();
+  }
+  wakeDisplayFromSleep();
   blState          = BL_STATE_FULL;
-  tft.setBrightness(getFullBrightnessPwm());
   lastTouchMs      = now;
   waitingSecondTap = false;
   alertStartedMs   = now;
@@ -8701,6 +9218,7 @@ void wakeDisplayForAlert(AlertRingtone tone) {
   triggerTouchVibration();
   startAlertRingtone(tone);
   renderCurrentScreen();
+  tft.setBrightness(getFullBrightnessPwm());
 }
 
 // Miniature waveform icon on Sound generator buttons
@@ -9417,12 +9935,16 @@ void restoreWifiAfterBleScan() {
   }
   if (btWifiPausedForBle) {
     btWifiPausedForBle = false;
-    WiFi.mode(WIFI_STA);
-    WiFi.setSleep(false);
-    delay(40);
+    if (settingWifiEnabled) {
+      WiFi.mode(WIFI_STA);
+      WiFi.setSleep(false);
+      delay(40);
+    }
   } else if (btWifiSleepForBle) {
     btWifiSleepForBle = false;
-    WiFi.setSleep(false);
+    if (settingWifiEnabled) {
+      WiFi.setSleep(false);
+    }
   }
 }
 
@@ -10015,12 +10537,16 @@ void stopBleHidKeyboard() {
 
   if (btKbWifiPaused) {
     btKbWifiPaused = false;
-    WiFi.mode(WIFI_STA);
-    WiFi.setSleep(false);
-    delay(40);
-    if (btKbWifiWasConnected) {
+    if (settingWifiEnabled) {
+      WiFi.mode(WIFI_STA);
+      WiFi.setSleep(false);
+      delay(40);
+      if (btKbWifiWasConnected) {
+        btKbWifiWasConnected = false;
+        WiFi.reconnect();
+      }
+    } else {
       btKbWifiWasConnected = false;
-      WiFi.reconnect();
     }
   }
   bleHidPresenterMode = false;
@@ -10739,12 +11265,16 @@ void stopBleHidMouse() {
 
   if (btMouseWifiPaused) {
     btMouseWifiPaused = false;
-    WiFi.mode(WIFI_STA);
-    WiFi.setSleep(false);
-    delay(40);
-    if (btMouseWifiWasConnected) {
+    if (settingWifiEnabled) {
+      WiFi.mode(WIFI_STA);
+      WiFi.setSleep(false);
+      delay(40);
+      if (btMouseWifiWasConnected) {
+        btMouseWifiWasConnected = false;
+        WiFi.reconnect();
+      }
+    } else {
       btMouseWifiWasConnected = false;
-      WiFi.reconnect();
     }
   }
 }
@@ -12078,9 +12608,10 @@ void fetchWeatherDataNow() {
   weatherFetchPending = false;
   if (currentScreen != SCREEN_WEATHER) return;
 
-  if (WiFi.status() != WL_CONNECTED) {
+  if (!settingWifiEnabled || WiFi.status() != WL_CONNECTED) {
     weatherData.valid = false;
-    snprintf(weatherData.errorMsg, sizeof(weatherData.errorMsg), "Wi-Fi not connected");
+    snprintf(weatherData.errorMsg, sizeof(weatherData.errorMsg),
+             settingWifiEnabled ? "Wi-Fi not connected" : "Wi-Fi disabled");
     weatherView = WEATHER_VIEW_ERROR;
     renderCurrentScreen();
     return;
@@ -12696,9 +13227,10 @@ void fetchSunActivityNow() {
   sunFetchPending = false;
   if (currentScreen != SCREEN_SUN_ACTIVITY) return;
 
-  if (WiFi.status() != WL_CONNECTED) {
+  if (!settingWifiEnabled || WiFi.status() != WL_CONNECTED) {
     sunData.valid = false;
-    snprintf(sunData.errorMsg, sizeof(sunData.errorMsg), "Wi-Fi not connected");
+    snprintf(sunData.errorMsg, sizeof(sunData.errorMsg),
+             settingWifiEnabled ? "Wi-Fi not connected" : "Wi-Fi disabled");
     sunView = SUN_VIEW_ERROR;
     renderCurrentScreen();
     return;
@@ -13874,7 +14406,14 @@ void startCwToneAudio(float freqHz, float gain) {
 
   cwToneFreqHz = freqHz;
   cwToneGain   = gain;
-  if (cwAudioPlaying && cwAudioTaskHandle != NULL) return;
+  if (cwAudioPlaying && cwAudioTaskHandle != NULL) {
+    setSpeakerAmpPower(true);
+    return;
+  }
+
+  // Power ON MAX98357A speaker amplifier rail (AXP2101 DLDO1) for SOS / Morse audio
+  setSpeakerAmpPower(true);
+  delay(5);
 
 #if ESP_IDF_VERSION_MAJOR >= 5
   i2s_chan_config_t chanCfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_1, I2S_ROLE_MASTER);
@@ -13882,6 +14421,7 @@ void startCwToneAudio(float freqHz, float gain) {
   chanCfg.dma_frame_num = SND_GEN_CHUNK_SAMPLES;
   if (i2s_new_channel(&chanCfg, &cwTxChan, NULL) != ESP_OK) {
     cwTxChan = NULL;
+    updateSpeakerAmpPower();
     return;
   }
 
@@ -13899,6 +14439,7 @@ void startCwToneAudio(float freqHz, float gain) {
       i2s_channel_enable(cwTxChan) != ESP_OK) {
     i2s_del_channel(cwTxChan);
     cwTxChan = NULL;
+    updateSpeakerAmpPower();
     return;
   }
 #else
@@ -13924,6 +14465,7 @@ void startCwToneAudio(float freqHz, float gain) {
   pinCfg.data_in_num  = I2S_PIN_NO_CHANGE;
 
   if (i2s_driver_install(I2S_NUM_1, &i2sCfg, 0, NULL) != ESP_OK) {
+    updateSpeakerAmpPower();
     return;
   }
   i2s_set_pin(I2S_NUM_1, &pinCfg);
@@ -13944,12 +14486,16 @@ void startCwToneAudio(float freqHz, float gain) {
 #else
     i2s_driver_uninstall(I2S_NUM_1);
 #endif
+    updateSpeakerAmpPower();
   }
 }
 
 void stopCwToneAudio() {
   cwToneGateOn = false;
-  if (!cwAudioPlaying && cwAudioTaskHandle == NULL) return;
+  if (!cwAudioPlaying && cwAudioTaskHandle == NULL) {
+    updateSpeakerAmpPower();
+    return;
+  }
   cwAudioStopReq = true;
   cwAudioPlaying = false;
 
@@ -13967,6 +14513,7 @@ void stopCwToneAudio() {
 #else
   i2s_driver_uninstall(I2S_NUM_1);
 #endif
+  updateSpeakerAmpPower();
 }
 
 // Start continuous emergency SOS beacon (max volume beep, max brightness strobe, DRV2605L vibration)
@@ -16088,7 +16635,7 @@ bool syncClockFromGPS() {
 
 // Sync RTC clock from standard NTP server (when Wi-Fi is connected)
 bool syncClockFromNTP() {
-  if (WiFi.status() != WL_CONNECTED) {
+  if (!settingWifiEnabled || WiFi.status() != WL_CONNECTED) {
     return false;
   }
   snprintf(clockSyncStatusMsg, sizeof(clockSyncStatusMsg), "SYNCING NTP...");
@@ -16684,7 +17231,7 @@ void handleScreenTap(int16_t x, int16_t y) {
     }
 
     if (x >= 196 && y <= 34) {
-      stepCount = 0;
+      resetBma423HardwareSteps();
       saveStepCountToFlash(true);
       renderCurrentScreen();
       return;
@@ -16992,6 +17539,7 @@ void handleScreenTap(int16_t x, int16_t y) {
         uint8_t row = (uint8_t)((y - 36) / 50);
         uint8_t itemIdx = (uint8_t)(settingsScrollOffset + row);
         if (itemIdx == 0) {
+          editWifiEnabled     = settingWifiEnabled;
           editWifiAutoConnect = settingWifiAutoConnect;
           settingsView = SETTINGS_VIEW_WIFI_AUTO;
           renderCurrentScreen();
@@ -17038,13 +17586,27 @@ void handleScreenTap(int16_t x, int16_t y) {
           renderCurrentScreen();
           return;
         }
+        if (itemIdx == 7) {
+          editWakeOnTouch  = settingWakeOnTouch;
+          editWakeOnBma423 = settingWakeOnBma423;
+          editWakeOnButton = settingWakeOnButton;
+          settingsView = SETTINGS_VIEW_WAKE_CONDITION;
+          renderCurrentScreen();
+          return;
+        }
       }
       return;
     }
 
     if (settingsView == SETTINGS_VIEW_WIFI_AUTO) {
-      // Tap toggle switch
-      if (x >= 56 && x <= 184 && y >= 72 && y <= 140) {
+      // Row 1: Global "Wi-Fi enabled" toggle
+      if (x >= 12 && x <= 228 && y >= 64 && y <= 112) {
+        editWifiEnabled = !editWifiEnabled;
+        renderCurrentScreen();
+        return;
+      }
+      // Row 2: "Wi-Fi autoconnect" toggle
+      if (x >= 12 && x <= 228 && y >= 114 && y <= 164) {
         editWifiAutoConnect = !editWifiAutoConnect;
         renderCurrentScreen();
         return;
@@ -17055,10 +17617,12 @@ void handleScreenTap(int16_t x, int16_t y) {
         renderCurrentScreen();
         return;
       }
-      // OK -> save to Flash and return to list
+      // OK -> save to Flash, apply Wi-Fi power state, and return to list
       if (x >= 124 && x <= 232 && y >= 174 && y <= 228) {
+        settingWifiEnabled     = editWifiEnabled;
         settingWifiAutoConnect = editWifiAutoConnect;
         saveWatchSettings();
+        applyWifiPowerState();
         settingsView = SETTINGS_VIEW_LIST;
         renderCurrentScreen();
         return;
@@ -17251,12 +17815,61 @@ void handleScreenTap(int16_t x, int16_t y) {
         renderCurrentScreen();
         return;
       }
-      // OK -> save GPS/LoRa power enables to Flash, apply to AXP2101, and return to list
+      // OK -> save GPS/LoRa power enables to Flash, set GPS UART Hi-Z if disabled, apply AXP2101 rails, return to list
       if (x >= 124 && x <= 232 && y >= 174 && y <= 228) {
         settingPowerGps  = editPowerGps;
         settingPowerLora = editPowerLora;
         saveWatchSettings();
+        if (!settingPowerGps) {
+          applyGpsUartState(); // Put GPS RX/TX into high-impedance INPUT before cutting BLDO1
+        }
         applyAxp2101PowerSettings();
+        if (settingPowerGps) {
+          delay(10);
+          applyGpsUartState(); // Start GPS UART after BLDO1 power rail stabilizes
+        }
+        settingsView = SETTINGS_VIEW_LIST;
+        renderCurrentScreen();
+        return;
+      }
+      return;
+    }
+
+    if (settingsView == SETTINGS_VIEW_WAKE_CONDITION) {
+      // Row 1: Touch wake (TOUCH_INT_PIN / IO16)
+      if (x >= 12 && x <= 228 && y >= 50 && y <= 89) {
+        editWakeOnTouch = !editWakeOnTouch;
+        renderCurrentScreen();
+        return;
+      }
+      // Row 2: BMA423 interrupt wake (IO14)
+      if (x >= 12 && x <= 228 && y >= 90 && y <= 129) {
+        editWakeOnBma423 = !editWakeOnBma423;
+        renderCurrentScreen();
+        return;
+      }
+      // Row 3: Button wake (IO0)
+      if (x >= 12 && x <= 228 && y >= 130 && y <= 169) {
+        editWakeOnButton = !editWakeOnButton;
+        renderCurrentScreen();
+        return;
+      }
+      // Cancel -> discard edits and return to Settings list
+      if (x >= 8 && x <= 116 && y >= 174 && y <= 228) {
+        settingsView = SETTINGS_VIEW_LIST;
+        renderCurrentScreen();
+        return;
+      }
+      // OK -> save wake-up conditions to Flash (requires >= 1 enabled source), apply BMA423 INT1, return to list
+      if (x >= 124 && x <= 232 && y >= 174 && y <= 228) {
+        if (!editWakeOnTouch && !editWakeOnBma423 && !editWakeOnButton) {
+          return;
+        }
+        settingWakeOnTouch  = editWakeOnTouch;
+        settingWakeOnBma423 = editWakeOnBma423;
+        settingWakeOnButton = editWakeOnButton;
+        saveWatchSettings();
+        configureBma423WakeInterrupt();
         settingsView = SETTINGS_VIEW_LIST;
         renderCurrentScreen();
         return;
@@ -18559,8 +19172,232 @@ void handleScreenTap(int16_t x, int16_t y) {
 }
 
 // ============================================================================
-// 9. BACKLIGHT, TOUCHSCREEN, AND EARTH ROTATION MANAGEMENT
+// 9. BACKLIGHT, LIGHT SLEEP POWER MANAGEMENT, AND TOUCHSCREEN
 // ============================================================================
+
+// Put ST7789V display controller into sleep mode (DISPOFF + SLPIN)
+void putDisplayToSleep() {
+  tft.setBrightness(BRIGHTNESS_OFF);
+  if (!displaySleeping) {
+    tft.sleep();
+    displaySleeping = true;
+  }
+}
+
+// Wake ST7789V display controller from sleep mode (SLPOUT + DISPON)
+void wakeDisplayFromSleep() {
+  if (displaySleeping) {
+    tft.wakeup();
+    delay(20);
+    displaySleeping = false;
+  }
+}
+
+// Power down Wi-Fi and Bluetooth radios cleanly before ESP32 Light Sleep
+void disableRadiosForLightSleep() {
+  if (bleHidKbActive) {
+    stopBleHidKeyboard();
+  }
+  if (bleHidMouseActive) {
+    stopBleHidMouse();
+  }
+  if (btScanRunning) {
+    btScanRunning = false;
+    btScanPending = false;
+  }
+  if (BLEDevice::getInitialized()) {
+    BLEScan* pScan = BLEDevice::getScan();
+    if (pScan != NULL) {
+      pScan->stop();
+      pScan->clearResults();
+    }
+    BLEDevice::stopAdvertising();
+    BLEDevice::deinit(false);
+    delay(20);
+  }
+  bleStackInitialized = false;
+  btStop();
+
+  wifiBgScanning = false;
+  WiFi.scanDelete();
+  WiFi.disconnect(true, false);
+  esp_wifi_stop();
+  WiFi.mode(WIFI_OFF);
+  wifiInfoConnected = false;
+}
+
+// Compute microseconds until next pending Timer or Alarm check (0 if none active)
+uint64_t computeNextAlertWakeUs() {
+  uint32_t now = millis();
+  uint64_t bestMs = 0;
+
+  if (timerRunning) {
+    int32_t rem = (int32_t)(timerEndMs - now);
+    uint64_t remMs = (rem > 250) ? (uint64_t)rem : 250ULL;
+    bestMs = remMs;
+  }
+
+  for (uint8_t i = 0; i < ALARM_COUNT; i++) {
+    if (!alarms[i].enabled) continue;
+    uint64_t candMs = 30000ULL; // Wake every 30 s to verify RTC minute match when an alarm is armed
+    if (alarms[i].snoozePending) {
+      int32_t rem = (int32_t)(alarms[i].snoozeTargetMs - now);
+      candMs = (rem > 250) ? (uint64_t)rem : 250ULL;
+    }
+    if (bestMs == 0 || candMs < bestMs) {
+      bestMs = candMs;
+    }
+  }
+
+  return bestMs * 1000ULL;
+}
+
+// Enter ESP32-S3 Light Sleep in BL_STATE_OFF with display sleep, FT6336U Monitor Mode,
+// Wi-Fi/BT off, USB Serial off, and AXP2101 DLDO1/ALDO4/BLDO2 off (preserving GPS BLDO1 if enabled)
+void enterDisplayOffLightSleep() {
+  stopTouchVibrationNow();
+  saveStepCountToFlash(false);
+
+  // 1. Put ST7789V display controller into sleep mode
+  putDisplayToSleep();
+
+  // 2. Disable Wi-Fi and Bluetooth completely for lowest Light Sleep current
+  disableRadiosForLightSleep();
+
+  // 3. Switch FT6336U into Monitor Mode (or Hibernate if touch wake is disabled)
+  bool useTouchWake  = settingWakeOnTouch;
+  bool useBmaWake    = settingWakeOnBma423;
+  bool useButtonWake = settingWakeOnButton;
+  if (!useTouchWake && !useBmaWake && !useButtonWake) {
+    useButtonWake = true;
+  }
+
+  if (useTouchWake) {
+    setTouchMonitorMode();
+  } else {
+    setTouchHibernateMode();
+  }
+
+  // 4. Configure BMA423 INT1 (IO14) and clear any latched status
+  configureBma423WakeInterrupt();
+  if (bma423Ready) {
+    (void)readRegI2C(Wire, bma423Addr, BMA423_REG_INT_STATUS_0);
+  }
+
+  // 5. Power down AXP2101 DLDO1, ALDO4, BLDO2 rails (preserving GPS BLDO1 if enabled in Settings)
+  applyAxp2101LightSleepRails();
+
+  // 6. Disable USB Serial before Light Sleep
+  Serial.flush();
+  Serial.end();
+
+  // 7. Configure GPIO Light Sleep wake-up lines (all active LOW with internal pull-up)
+  gpio_wakeup_disable((gpio_num_t)TOUCH_INT_PIN);
+  gpio_wakeup_disable((gpio_num_t)BMA423_INT_PIN);
+  gpio_wakeup_disable((gpio_num_t)WAKE_BUTTON_PIN);
+
+  if (useTouchWake) {
+    pinMode(TOUCH_INT_PIN, INPUT_PULLUP);
+    gpio_wakeup_enable((gpio_num_t)TOUCH_INT_PIN, GPIO_INTR_LOW_LEVEL);
+  }
+  if (useBmaWake) {
+    pinMode(BMA423_INT_PIN, INPUT_PULLUP);
+    gpio_wakeup_enable((gpio_num_t)BMA423_INT_PIN, GPIO_INTR_LOW_LEVEL);
+  }
+  if (useButtonWake) {
+    pinMode(WAKE_BUTTON_PIN, INPUT_PULLUP);
+    gpio_wakeup_enable((gpio_num_t)WAKE_BUTTON_PIN, GPIO_INTR_LOW_LEVEL);
+  }
+  esp_sleep_enable_gpio_wakeup();
+
+  // 8. Sleep loop: remain in Light Sleep until a valid wake condition occurs
+  bool wokeValid = false;
+  while (!wokeValid) {
+    // Wait briefly for any currently-held wake pin to release HIGH before arming LOW-level sleep
+    uint32_t settleStart = millis();
+    while (millis() - settleStart < 350UL) {
+      bool anyLow = false;
+      if (useTouchWake && digitalRead(TOUCH_INT_PIN) == LOW) anyLow = true;
+      if (useButtonWake && digitalRead(WAKE_BUTTON_PIN) == LOW) anyLow = true;
+      if (!anyLow) break;
+      delay(5);
+    }
+
+    // Arm timer wakeup if a countdown Timer or Alarm is active
+    uint64_t nextAlertUs = computeNextAlertWakeUs();
+    if (nextAlertUs > 0) {
+      esp_sleep_enable_timer_wakeup(nextAlertUs);
+    } else {
+      esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_TIMER);
+    }
+
+    esp_light_sleep_start();
+
+    esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
+    if (cause == ESP_SLEEP_WAKEUP_TIMER) {
+      readRTC(rtcTime);
+      updateAlarmAndTimer();
+      if (activeAlertType != ALERT_NONE) {
+        wokeValid = true;
+      }
+    }
+    else if (cause == ESP_SLEEP_WAKEUP_GPIO) {
+      if (useButtonWake && digitalRead(WAKE_BUTTON_PIN) == LOW) {
+        delay(25);
+        wokeValid = true;
+      }
+      else if (useBmaWake && digitalRead(BMA423_INT_PIN) == LOW) {
+        if (bma423Ready) {
+          (void)readRegI2C(Wire, bma423Addr, BMA423_REG_INT_STATUS_0);
+        }
+        wokeValid = true;
+      }
+      else if (useTouchWake && digitalRead(TOUCH_INT_PIN) == LOW) {
+        uint8_t requiredTaps = (settingWakeTapCount == 3) ? 3 : 2;
+        if (detectMultiTapOnTouchInt(requiredTaps)) {
+          wokeValid = true;
+        }
+      }
+    }
+  }
+
+  // 9. Restore active state, AXP2101 rails, DRV2605L, and USB Serial after valid wake-up
+  esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_GPIO);
+  esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_TIMER);
+  gpio_wakeup_disable((gpio_num_t)TOUCH_INT_PIN);
+  gpio_wakeup_disable((gpio_num_t)BMA423_INT_PIN);
+  gpio_wakeup_disable((gpio_num_t)WAKE_BUTTON_PIN);
+
+  applyAxp2101PowerSettings();
+  delay(15);
+  reinitDRV2605LAfterSleep();
+  Serial.begin(115200);
+
+  setTouchActiveMode();
+  wakeDisplayFromSleep();
+
+  // Sync RTC, battery, and BMA423 hardware pedometer accumulated during Light Sleep
+  readRTC(rtcTime);
+  batteryPercent  = readBatteryPercent();
+  batteryCharging = readBatteryCharging();
+  syncBma423HardwareSteps();
+
+  blState          = BL_STATE_FULL;
+  lastTouchMs      = millis();
+  lastRtcReadMs    = lastTouchMs;
+  wakeTapCounter   = 0;
+  waitingSecondTap = false;
+  touchWasPressed  = (digitalRead(TOUCH_INT_PIN) == LOW);
+
+  renderCurrentScreen();
+  tft.setBrightness(getFullBrightnessPwm());
+
+  // Re-enable Wi-Fi STA for background auto-reconnect only when Wi-Fi is globally enabled
+  if (settingWifiEnabled && settingWifiAutoConnect && savedWifiCount > 0) {
+    WiFi.mode(WIFI_STA);
+    lastWifiAutoCheckMs = 0;
+  }
+}
 
 void updateTouchAndBacklight() {
   uint32_t now = millis();
@@ -18586,12 +19423,14 @@ void updateTouchAndBacklight() {
           wakeTapCounter++;
           lastWakeTapMs = now;
           if (wakeTapCounter >= requiredTaps) {
+            if (touchInMonitorMode) setTouchActiveMode();
+            wakeDisplayFromSleep();
             blState = BL_STATE_FULL;
-            tft.setBrightness(getFullBrightnessPwm());
             lastTouchMs = now;
             wakeTapCounter = 0;
             waitingSecondTap = false;
             renderCurrentScreen();
+            tft.setBrightness(getFullBrightnessPwm());
           }
         } else if (dt > DOUBLE_TAP_MAX_MS) {
           wakeTapCounter = 1;
@@ -18753,6 +19592,7 @@ void updateTouchAndBacklight() {
   if (activeAlertType != ALERT_NONE) {
     lastTouchMs = now;
     if (blState != BL_STATE_FULL) {
+      wakeDisplayFromSleep();
       blState = BL_STATE_FULL;
       tft.setBrightness(getFullBrightnessPwm());
     }
@@ -18762,6 +19602,7 @@ void updateTouchAndBacklight() {
   // If 0 seconds selected, keep backlight on permanently
   if (settingDisplayLightSec == 0) {
     if (blState != BL_STATE_FULL) {
+      wakeDisplayFromSleep();
       blState = BL_STATE_FULL;
       tft.setBrightness(getFullBrightnessPwm());
     }
@@ -18778,9 +19619,9 @@ void updateTouchAndBacklight() {
   }
   else if (blState != BL_STATE_OFF && idleMs >= offMs) {
     blState = BL_STATE_OFF;
-    tft.setBrightness(BRIGHTNESS_OFF);
     waitingSecondTap = false;
     wakeTapCounter = 0;
+    enterDisplayOffLightSleep();
   }
 }
 
@@ -18929,6 +19770,7 @@ static void feedGpsNmeaChar(char ch) {
 }
 
 void updateGPS() {
+  if (!settingPowerGps || !gpsUartActive) return;
   while (GPSSerial.available() > 0) {
     char ch = (char)GPSSerial.read();
     lastGpsByteMs = millis();
@@ -19593,6 +20435,8 @@ void showBootSplashScreen() {
 }
 
 void setup() {
+  // Lower ESP32-S3 CPU clock to 80 MHz in active mode for power savings
+  setCpuFrequencyMhz(ACTIVE_CPU_FREQ_MHZ);
   Serial.begin(115200);
 
   // 0. Load saved watch settings from Flash before initializing AXP2101 (charge current & GPS/LoRa rails)
@@ -19620,7 +20464,9 @@ void setup() {
   // 3. Initialize DRV2605L haptic driver and buzz for 250 ms while boot splash is visible
   initDRV2605L();
 
-  // 4. Initialize BMA423 accelerometer for step counter
+  // 4. Configure BMA423 INT1 (IO14) & wake button (IO0) and initialize BMA423 hardware pedometer
+  pinMode(BMA423_INT_PIN, INPUT_PULLUP);
+  pinMode(WAKE_BUTTON_PIN, INPUT_PULLUP);
   initBMA423();
 
   // 5. Set safe initial level on IR LED pin (GPIO2 -> Q15 MMBT3904) and configure LEDC PWM after tft.init()
@@ -19634,9 +20480,8 @@ void setup() {
   Wire1.begin(TOUCH_SDA_PIN, TOUCH_SCL_PIN, 400000);
   initTouchScreen();
 
-  // 7. Start UART for MIA-M10Q GPS module (38400 baud, RX=41, TX=42)
-  pinMode(GPS_PPS_PIN, INPUT);
-  GPSSerial.begin(currentGpsBaud, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
+  // 7. Configure GPS UART (38400 baud when GPS enabled, Hi-Z INPUT when disabled in Settings)
+  applyGpsUartState();
 
   // 8. Initial read of RTC time, battery level/charging, and ESP32/BMA423/AXP2101 temperature sensors
   readRTC(rtcTime);
@@ -19646,9 +20491,9 @@ void setup() {
   batteryCharging = readBatteryCharging();
   recordEsp32TempSample();
 
-  // 9. Initialize Wi-Fi STA and load saved networks (up to 64 LIFO) from Flash
-  WiFi.mode(WIFI_STA);
+  // 9. Apply global Wi-Fi power setting (STA if enabled, OFF if disabled) and load saved networks
   loadSavedWifiCredentials();
+  applyWifiPowerState();
 
   // Keep Manul boot splash on screen for a full 1 second (1000 ms) total
   while (millis() - bootSplashStartMs < BOOT_SPLASH_MS) {

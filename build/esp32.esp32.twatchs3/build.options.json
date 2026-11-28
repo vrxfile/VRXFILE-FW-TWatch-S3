@@ -1,10 +1,10 @@
 {
   "additionalFiles": "",
-  "builtInLibrariesFolders": "C:\\Users\\rvarzar\\AppData\\Local\\Arduino15\\libraries",
+  "builtInLibrariesFolders": "C:\\Users\\vrxfi\\AppData\\Local\\Arduino15\\libraries",
   "compiler.optimization_flags": "-Os",
   "customBuildProperties": "",
   "fqbn": "esp32:esp32:twatchs3:UploadSpeed=921600,USBMode=hwcdc,CDCOnBoot=default,MSCOnBoot=default,DFUOnBoot=default,UploadMode=default,CPUFreq=240,PartitionScheme=app3M_fat9M_16MB,DebugLevel=none,LoopCore=1,EventsCore=1,EraseFlash=all,JTAGAdapter=default,Revision=Radio_SX1262",
-  "hardwareFolders": "C:\\Users\\rvarzar\\AppData\\Local\\Arduino15\\packages\\esp32\\hardware\\esp32\\3.3.12,C:\\Users\\rvarzar\\AppData\\Local\\Arduino15\\packages\\esp32\\hardware\\esp32\\3.3.12",
-  "otherLibrariesFolders": "c:\\Users\\rvarzar\\Documents\\Arduino\\libraries",
-  "sketchLocation": "C:\\Downloads\\VRXFILE-FW-TWatch-S3"
+  "hardwareFolders": "C:\\Users\\vrxfi\\AppData\\Local\\Arduino15\\packages\\esp32\\hardware\\esp32\\3.3.12,C:\\Users\\vrxfi\\AppData\\Local\\Arduino15\\packages\\esp32\\hardware\\esp32\\3.3.12",
+  "otherLibrariesFolders": "c:\\Users\\vrxfi\\Documents\\Arduino\\libraries",
+  "sketchLocation": "Q:\\Downloads\\VRXFILE-FW-TWatch-S3"
 }
